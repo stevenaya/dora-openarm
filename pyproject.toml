@@ -42,3 +42,7 @@ extend-select = [
   "D",   # pydocstyle
   "UP"
 ]
+
+[tool.uv.sources]
+
+openarm-driver = { git = "https://github.com/enactic/openarm_driver.git", rev = "main" }
