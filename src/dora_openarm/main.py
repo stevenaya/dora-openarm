@@ -138,14 +138,15 @@ def main():
             )
         elif event_id == "request_state":
             state = arm.fetch_state(refresh=args.refresh_every_request)
+            qpos = pa.array(state["qpos"], type=pa.float32())
+            qvel = pa.array(state["qvel"], type=pa.float32())
+            qtorque = pa.array(state["qtorque"], type=pa.float32())
+
+            node.send_output("position", qpos)
             node.send_output(
                 "state",
                 pa.StructArray.from_arrays(
-                    [
-                        pa.array(state["qpos"], type=pa.float32()),
-                        pa.array(state["qvel"], type=pa.float32()),
-                        pa.array(state["qtorque"], type=pa.float32()),
-                    ],
+                    [qpos, qvel, qtorque],
                     names=["qpos", "qvel", "qtorque"],
                 ),
             )

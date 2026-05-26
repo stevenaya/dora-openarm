@@ -53,14 +53,14 @@ nodes:
 | Input | Description |
 | --- | --- |
 | `request_position` | Requests the current arm position. The event ID is used and the event value is ignored. |
-| `request_state` | Requests the current arm state. The event ID is used and the event value is ignored. |
+| `request_state` | Requests the current arm state. The event ID is used and the event value is ignored. Also outputs `position` from the same state read. |
 | `move_position` | Sends a new target position to the arm. The value may be a position array directly, or a struct containing `new_position`. When the node has not been initialized yet, this input first drives the alignment step. |
 
 ### Outputs
 
 | Output | Description |
 | --- | --- |
-| `position` | Current arm position as a float32 array. |
+| `position` | Current arm position as a float32 array. Emitted for `request_position` and `request_state`. |
 | `state` | Current arm state as a struct with float32 array fields `qpos`, `qvel`, and `qtorque`. |
 | `status` | A string array containing `ready` once the initial alignment completes. |
 
