@@ -59,7 +59,7 @@ def _align(arm, state, new_position, name, threshold, trigger=None):
         state.align_target = current_position()
 
     def is_aligned(position1, position2):
-        return np.all(np.abs(position1 - position2) < threshold)
+        return np.all(np.abs(position1[:-1] - position2[:-1]) < threshold)
 
     # If OpenArm is already aligned, we do nothing.
     if is_aligned(new_position, current_position()):
