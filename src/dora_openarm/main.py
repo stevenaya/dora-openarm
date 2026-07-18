@@ -149,16 +149,16 @@ def main():
         type=float,
     )
     parser.add_argument(
+        "--align-step-limit",
+        default=0.001,
+        help="Maximum joint delta per alignment command [rad] (default: 0.001).",
+        type=float,
+    )
+    parser.add_argument(
         "--align",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Align to the first position command after start (default: enabled).",
-    )
-    parser.add_argument(
-        "--control-hz",
-        type=float,
-        default=None,
-        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--stop",
@@ -179,6 +179,8 @@ def main():
         help="Start the arm on startup.",
     )
     args = parser.parse_args()
+    if args.align_step_limit <= 0.0:
+        parser.error("--align-step-limit must be positive")
     node = dora.Node()
     name = f"{args.side}_arm"
     config = openarm_driver.Config(args.config)
@@ -187,7 +189,9 @@ def main():
     if args.start_on_startup:
         arm = openarm_driver.SingleArmDriver(name, config)
         arm.start()
-        align_state = AlignState() if args.align else None
+        align_state = (
+            AlignState(step_limit=args.align_step_limit) if args.align else None
+        )
         status = ArmStatus.STARTED if args.align else ArmStatus.ALIGNED
         node.send_output("status", pa.array([status]))
     else:
@@ -208,7 +212,9 @@ def main():
                     name, config
                 )  # Re-initialize the arm to ensure a fresh start
                 arm.start()
-                align_state = AlignState() if args.align else None
+                align_state = (
+                    AlignState(step_limit=args.align_step_limit) if args.align else None
+                )
                 status = ArmStatus.STARTED if args.align else ArmStatus.ALIGNED
                 node.send_output("status", pa.array([status]))
             elif command == "stop":
