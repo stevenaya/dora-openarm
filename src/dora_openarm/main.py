@@ -59,7 +59,7 @@ def _align(arm, state, new_position, name, threshold, trigger=None):
         state.align_target = current_position()
 
     def is_aligned(position1, position2):
-        return np.all(np.abs(position1 - position2) < threshold)
+        return np.all(np.abs(position1[:-1] - position2[:-1]) < threshold)
 
     # If OpenArm is already aligned, we do nothing.
     if is_aligned(new_position, current_position()):
@@ -149,6 +149,18 @@ def main():
         type=float,
     )
     parser.add_argument(
+        "--align",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Align to the first position command after start (default: enabled).",
+    )
+    parser.add_argument(
+        "--control-hz",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--stop",
         action=argparse.BooleanOptionalAction,
         default=_env_flag("STOP", True),
@@ -175,10 +187,11 @@ def main():
     if args.start_on_startup:
         arm = openarm_driver.SingleArmDriver(name, config)
         arm.start()
-        align_state = AlignState()
-        status = ArmStatus.STARTED
-        node.send_output("status", pa.array([ArmStatus.STARTED]))
+        align_state = AlignState() if args.align else None
+        status = ArmStatus.STARTED if args.align else ArmStatus.ALIGNED
+        node.send_output("status", pa.array([status]))
     else:
+        align_state = None
         status = ArmStatus.STOPPED
         node.send_output("status", pa.array([ArmStatus.STOPPED]))
     for event in node:
@@ -195,15 +208,16 @@ def main():
                     name, config
                 )  # Re-initialize the arm to ensure a fresh start
                 arm.start()
-                align_state = AlignState()
-                status = ArmStatus.STARTED
-                node.send_output("status", pa.array([ArmStatus.STARTED]))
+                align_state = AlignState() if args.align else None
+                status = ArmStatus.STARTED if args.align else ArmStatus.ALIGNED
+                node.send_output("status", pa.array([status]))
             elif command == "stop":
                 status = ArmStatus.STOPPED
                 node.send_output("status", pa.array([ArmStatus.STOPPED]))
                 if arm is not None:
                     arm.stop()
                     arm = None  # Drop the instance to free resources
+                align_state = None
         elif event_id == "request_position":
             if status is ArmStatus.STOPPED:
                 continue
@@ -238,17 +252,8 @@ def main():
                 # other_arm_position = None
 
             if status is ArmStatus.ALIGNED:
-                diverged = np.any(
-                    np.abs(new_position[:-1] - arm.last_command[:-1]) > align_threshold
-                )
-                if diverged:
-                    status = ArmStatus.STARTED
-                    align_state = AlignState()
-                    node.send_output("status", pa.array([ArmStatus.STARTED]))
-                else:
-                    arm.send_position(new_position)
-
-            if status is ArmStatus.STARTED:
+                arm.send_position(new_position)
+            elif status is ArmStatus.STARTED:
                 is_aligned = _align(
                     arm,
                     align_state,
