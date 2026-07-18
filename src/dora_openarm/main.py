@@ -15,7 +15,6 @@
 """Node to control OpenArm."""
 
 import argparse
-import dataclasses
 import enum
 import dora
 import openarm_driver
@@ -23,6 +22,11 @@ import os
 import pathlib
 import pyarrow as pa
 import numpy as np
+import time
+
+
+DEFAULT_COMMAND_DT_S = 1.0 / 250.0
+MAX_COMMAND_DT_S = 0.1
 
 
 class ArmStatus(str, enum.Enum):
@@ -30,47 +34,76 @@ class ArmStatus(str, enum.Enum):
 
     STOPPED = "stopped"
     STARTED = "started"
-    ALIGNED = "aligned"
 
 
-@dataclasses.dataclass
-class AlignState:
-    """State for alignment."""
+class CommandShapeState:
+    """State for velocity command shaping."""
 
-    align_target: np.ndarray = None
-    step_limit: float = 0.001
+    def __init__(
+        self,
+        position: np.ndarray | None = None,
+        time_s: float | None = None,
+    ):
+        self.position = position
+        self.time_s = time_s
 
 
-def _align(arm, state, new_position, name, threshold, trigger=None):
-    """Safety: Align OpenArm with the position."""
-    if trigger == "gripper":  # Check if gripper is active (threshold ~ -10 deg)
-        gripper_position = new_position[-1]  # Last value is gripper's position
-        if name == "right_arm":
-            is_gripping = gripper_position > np.deg2rad(-5)
-        elif name == "left_arm":
-            is_gripping = gripper_position < np.deg2rad(5)
-        if not is_gripping:
-            return False
+def _load_command_limits(config) -> np.ndarray:
+    """Load command velocity limits from the arm config."""
+    velocity_limits = np.asarray(config.get_joint_delta_position_limits(), dtype=float)
+    if np.any(velocity_limits <= 0.0):
+        raise ValueError("Command velocity limits must be positive.")
+    return velocity_limits
 
-    def current_position():
-        return np.array(arm.fetch_position(), dtype=np.float32)
 
-    if state.align_target is None:
-        state.align_target = current_position()
+def _reset_shape_state(arm) -> CommandShapeState:
+    position = np.asarray(arm.last_command, dtype=float)
+    return CommandShapeState(
+        position=position.copy(),
+        time_s=time.monotonic(),
+    )
 
-    def is_aligned(position1, position2):
-        return np.all(np.abs(position1[:-1] - position2[:-1]) < threshold)
 
-    # If OpenArm is already aligned, we do nothing.
-    if is_aligned(new_position, current_position()):
-        return True
-    diff = new_position - state.align_target
-    step_move = np.clip(diff, -state.step_limit, state.step_limit)
-    state.align_target += step_move
+def _shape_position(
+    target: np.ndarray,
+    state: CommandShapeState,
+    velocity_limits: np.ndarray,
+    default_dt_s: float,
+) -> np.ndarray:
+    """Apply per-command velocity limits without adding acceleration lag."""
+    now_s = time.monotonic()
+    target = np.asarray(target, dtype=float)
+    if not np.all(np.isfinite(target)):
+        raise RuntimeError("Received non-finite joint position command.")
 
-    arm.send_position(state.align_target)
+    if state.position is None:
+        state.position = target.copy()
+    if target.shape != state.position.shape:
+        raise ValueError(
+            f"Command shape {target.shape} does not match arm shape {state.position.shape}."
+        )
+    if target.shape != velocity_limits.shape:
+        raise ValueError(
+            "Command shaping limits must have the same shape as the joint command."
+        )
 
-    return is_aligned(new_position, current_position())
+    dt_s = now_s - state.time_s if state.time_s is not None else default_dt_s
+    if not np.isfinite(dt_s) or dt_s <= 0.0 or dt_s > MAX_COMMAND_DT_S:
+        dt_s = default_dt_s
+
+    delta = target - state.position
+    max_delta = velocity_limits * dt_s
+    shaped_position = state.position + np.clip(delta, -max_delta, max_delta)
+    return shaped_position.astype(np.float32)
+
+
+def _record_sent_command(
+    arm,
+    state: CommandShapeState,
+) -> None:
+    sent_position = np.asarray(arm.last_command, dtype=float)
+    state.position = sent_position.copy()
+    state.time_s = time.monotonic()
 
 
 def _env_flag(name, default=False):
@@ -140,12 +173,18 @@ def main():
         "--align-trigger",
         choices=["gripper"],
         default=None,
-        help="Alignment trigger: gripper (default: None)",
+        help="Deprecated; command shaping is always active.",
     )
     parser.add_argument(
         "--align-threshold",
         default=0.1,
-        help="Alignment threshold [rad] (default: 0.1)",
+        help="Deprecated; kept for dataflow compatibility.",
+        type=float,
+    )
+    parser.add_argument(
+        "--control-hz",
+        default=1.0 / DEFAULT_COMMAND_DT_S,
+        help="Fallback command shaping rate in Hz (default: 250).",
         type=float,
     )
     parser.add_argument(
@@ -170,12 +209,16 @@ def main():
     node = dora.Node()
     name = f"{args.side}_arm"
     config = openarm_driver.Config(args.config)
-    align_threshold = args.align_threshold
+    velocity_limits = _load_command_limits(config)
+    if args.control_hz <= 0.0:
+        raise ValueError("--control-hz must be positive.")
+    default_dt_s = 1.0 / args.control_hz
     arm = None
+    shape_state = None
     if args.start_on_startup:
         arm = openarm_driver.SingleArmDriver(name, config)
         arm.start()
-        align_state = AlignState()
+        shape_state = _reset_shape_state(arm)
         status = ArmStatus.STARTED
         node.send_output("status", pa.array([ArmStatus.STARTED]))
     else:
@@ -195,7 +238,7 @@ def main():
                     name, config
                 )  # Re-initialize the arm to ensure a fresh start
                 arm.start()
-                align_state = AlignState()
+                shape_state = _reset_shape_state(arm)
                 status = ArmStatus.STARTED
                 node.send_output("status", pa.array([ArmStatus.STARTED]))
             elif command == "stop":
@@ -204,6 +247,7 @@ def main():
                 if arm is not None:
                     arm.stop()
                     arm = None  # Drop the instance to free resources
+                shape_state = None
         elif event_id == "request_position":
             if status is ArmStatus.STOPPED:
                 continue
@@ -237,29 +281,25 @@ def main():
                 new_position = np.array(value, dtype=np.float32)
                 # other_arm_position = None
 
-            if status is ArmStatus.ALIGNED:
-                diverged = np.any(
-                    np.abs(new_position[:-1] - arm.last_command[:-1]) > align_threshold
-                )
-                if diverged:
-                    status = ArmStatus.STARTED
-                    align_state = AlignState()
-                    node.send_output("status", pa.array([ArmStatus.STARTED]))
-                else:
-                    arm.send_position(new_position)
-
-            if status is ArmStatus.STARTED:
-                is_aligned = _align(
-                    arm,
-                    align_state,
+            if shape_state is None:
+                shape_state = _reset_shape_state(arm)
+            try:
+                shaped_position = _shape_position(
                     new_position,
-                    name,
-                    align_threshold,
-                    trigger=args.align_trigger,
+                    shape_state,
+                    velocity_limits,
+                    default_dt_s,
                 )
-                if is_aligned:
-                    status = ArmStatus.ALIGNED
-                    node.send_output("status", pa.array([ArmStatus.ALIGNED]))
+                arm.send_position(shaped_position)
+            except (RuntimeError, ValueError) as exc:
+                print(f"[safety] {exc}")
+                arm.stop()
+                arm = None
+                shape_state = None
+                status = ArmStatus.STOPPED
+                node.send_output("status", pa.array([ArmStatus.STOPPED]))
+                continue
+            _record_sent_command(arm, shape_state)
     if arm is not None:
         if args.stop:
             arm.stop()

@@ -43,8 +43,9 @@ nodes:
 | --- | --- |
 | `--side` | OpenArm side to control. Default: `right`. |
 | `--config` | Path to the OpenArm configuration file. Default: `openarm_cell.yaml`. |
-| `--align-trigger` | Optional trigger for the initial alignment step. Supported value: `gripper`. |
-| `--align-threshold` | Alignment threshold in radians. Default: `0.1`. |
+| `--align-trigger` | Deprecated; command shaping is always active. |
+| `--align-threshold` | Deprecated; kept for older dataflows. |
+| `--control-hz` | Fallback command shaping rate in Hz. Default: `250`. |
 | `--[no-]stop` | Whether to stop the arm when the node exits. Default: controlled by the `STOP` environment variable, or `true` when it is unset. |
 | `--[no-]refresh-every-request` | Whether to refresh OpenArm state before each request. Default: controlled by the `REFRESH` environment variable, or `true` when it is unset. |
 
@@ -54,7 +55,7 @@ nodes:
 | --- | --- |
 | `request_position` | Requests the current arm position. The event ID is used and the event value is ignored. |
 | `request_state` | Requests the current arm state. The event ID is used and the event value is ignored. |
-| `move_position` | Sends a new target position to the arm. The value may be a struct containing `qpos` (`[{"qpos": [...]}]`), a position array directly, or a legacy struct containing `new_position`. When the node has not been initialized yet, this input first drives the alignment step. |
+| `move_position` | Sends a new target position to the arm. The value may be a struct containing `qpos` (`[{"qpos": [...]}]`), a position array directly, or a legacy struct containing `new_position`. Commands are shaped against the previous command using the configured velocity limits. |
 
 ### Outputs
 
@@ -62,7 +63,7 @@ nodes:
 | --- | --- |
 | `position` | Current arm position as a length-1 struct containing a float32 array: `[{"qpos": [...]}]`. |
 | `state` | Current arm state as a length-1 struct with list fields: `[{"qpos": [...], "qvel": [...], "qtorque": [...], "tmos": [...], "trotor": [...]}]`. `qpos`, `qvel`, and `qtorque` are float32 lists; `tmos` (MOS temperature) and `trotor` (rotor temperature) are int32 lists per motor, in °C. |
-| `status` | A string array containing `ready` once the initial alignment completes. |
+| `status` | A string array containing `started` or `stopped`. |
 
 ## License
 
