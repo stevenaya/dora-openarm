@@ -186,13 +186,15 @@ def main():
     config = openarm_driver.Config(args.config)
     align_threshold = args.align_threshold
     arm = None
+    if_restart = not args.start_on_startup
+    ready_status = ArmStatus.ALIGNED if args.align else ArmStatus.STARTED
     if args.start_on_startup:
         arm = openarm_driver.SingleArmDriver(name, config)
         arm.start()
         align_state = (
             AlignState(step_limit=args.align_step_limit) if args.align else None
         )
-        status = ArmStatus.STARTED if args.align else ArmStatus.ALIGNED
+        status = ArmStatus.STARTED
         node.send_output("status", pa.array([status]))
     else:
         align_state = None
@@ -206,18 +208,22 @@ def main():
         if event_id == "command":
             command = event["value"][0].as_py()
             if command == "start":
-                if arm is not None:
-                    arm.stop()  # Stop the existing session before replacing it
-                arm = openarm_driver.SingleArmDriver(
-                    name, config
-                )  # Re-initialize the arm to ensure a fresh start
-                arm.start()
+                if arm is not None and if_restart:
+                    arm.stop()
+                    arm = None
+                if arm is None:
+                    arm = openarm_driver.SingleArmDriver(
+                        name, config
+                    )  # Re-initialize the arm to ensure a fresh start
+                    arm.start()
+                if_restart = True
                 align_state = (
                     AlignState(step_limit=args.align_step_limit) if args.align else None
                 )
-                status = ArmStatus.STARTED if args.align else ArmStatus.ALIGNED
+                status = ArmStatus.STARTED
                 node.send_output("status", pa.array([status]))
             elif command == "stop":
+                if_restart = True
                 status = ArmStatus.STOPPED
                 node.send_output("status", pa.array([ArmStatus.STOPPED]))
                 if arm is not None:
@@ -239,6 +245,10 @@ def main():
                 continue
             state = arm.fetch_state(refresh=args.refresh_every_request)
             node.send_output("state", build_state_output(state))
+            node.send_output(
+                "position",
+                build_qpos_output(np.asarray(state["qpos"], dtype=np.float32)),
+            )
         elif event_id == "move_position":
             if status is ArmStatus.STOPPED:
                 continue
@@ -257,7 +267,7 @@ def main():
                 new_position = np.array(value, dtype=np.float32)
                 # other_arm_position = None
 
-            if status is ArmStatus.ALIGNED:
+            if status is ready_status:
                 arm.send_position(new_position)
             elif status is ArmStatus.STARTED:
                 is_aligned = _align(
