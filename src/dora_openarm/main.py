@@ -52,17 +52,16 @@ def _align(arm, state, new_position, name, threshold, trigger=None):
         if not is_gripping:
             return False
 
-    def current_position():
-        return np.array(arm.fetch_position(), dtype=np.float32)
+    current_position = np.array(arm.fetch_position(), dtype=np.float32)
 
     if state.align_target is None:
-        state.align_target = current_position()
+        state.align_target = current_position.copy()
 
     def is_aligned(position1, position2):
         return np.all(np.abs(position1[:-1] - position2[:-1]) < threshold)
 
     # If OpenArm is already aligned, we do nothing.
-    if is_aligned(new_position, current_position()):
+    if is_aligned(new_position, current_position):
         return True
     diff = new_position - state.align_target
     step_move = np.clip(diff, -state.step_limit, state.step_limit)
@@ -70,7 +69,8 @@ def _align(arm, state, new_position, name, threshold, trigger=None):
 
     arm.send_position(state.align_target)
 
-    return is_aligned(new_position, current_position())
+    # Check the physical position on the next command after the arm has moved.
+    return False
 
 
 def _env_flag(name, default=False):
@@ -149,7 +149,7 @@ def main():
         type=float,
     )
     parser.add_argument(
-        "--align-step-limit",
+        "--align-delta-limit",
         default=0.001,
         help="Maximum joint delta per alignment command [rad] (default: 0.001).",
         type=float,
@@ -158,7 +158,7 @@ def main():
         "--align",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Align to the first position command after start (default: enabled).",
+        help="Align to incoming position commands after start (default: enabled).",
     )
     parser.add_argument(
         "--stop",
@@ -179,20 +179,22 @@ def main():
         help="Start the arm on startup.",
     )
     args = parser.parse_args()
-    if args.align_step_limit <= 0.0:
-        parser.error("--align-step-limit must be positive")
+    if args.align_delta_limit <= 0.0:
+        parser.error("--align-delta-limit must be positive")
     node = dora.Node()
     name = f"{args.side}_arm"
     config = openarm_driver.Config(args.config)
     align_threshold = args.align_threshold
     arm = None
-    if_restart = not args.start_on_startup
+    # Some flows still send one redundant start after --start-on-startup.
+    # Keep the existing driver for that first command, then restore restart behavior.
+    skip_initial_restart = args.start_on_startup
     ready_status = ArmStatus.ALIGNED if args.align else ArmStatus.STARTED
     if args.start_on_startup:
         arm = openarm_driver.SingleArmDriver(name, config)
         arm.start()
         align_state = (
-            AlignState(step_limit=args.align_step_limit) if args.align else None
+            AlignState(step_limit=args.align_delta_limit) if args.align else None
         )
         status = ArmStatus.STARTED
         node.send_output("status", pa.array([status]))
@@ -208,22 +210,22 @@ def main():
         if event_id == "command":
             command = event["value"][0].as_py()
             if command == "start":
-                if arm is not None and if_restart:
+                if arm is not None and not skip_initial_restart:
                     arm.stop()
                     arm = None
+                skip_initial_restart = False
                 if arm is None:
                     arm = openarm_driver.SingleArmDriver(
                         name, config
                     )  # Re-initialize the arm to ensure a fresh start
                     arm.start()
-                if_restart = True
                 align_state = (
-                    AlignState(step_limit=args.align_step_limit) if args.align else None
+                    AlignState(step_limit=args.align_delta_limit) if args.align else None
                 )
                 status = ArmStatus.STARTED
                 node.send_output("status", pa.array([status]))
             elif command == "stop":
-                if_restart = True
+                skip_initial_restart = False
                 status = ArmStatus.STOPPED
                 node.send_output("status", pa.array([ArmStatus.STOPPED]))
                 if arm is not None:
