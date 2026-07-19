@@ -47,6 +47,7 @@ nodes:
 | `--align-threshold` | Alignment threshold in radians. Default: `0.1`. |
 | `--align-delta-limit` | Maximum joint delta per initial-alignment command in radians. Default: `0.001`. |
 | `--[no-]align` | Whether to align to incoming position commands after the arm starts. Default: enabled. |
+| `--[no-]start-on-startup` | Whether to start the arm when the node starts. Default: disabled. |
 | `--[no-]stop` | Whether to stop the arm when the node exits. Default: controlled by the `STOP` environment variable, or `true` when it is unset. |
 | `--[no-]refresh-every-request` | Whether to refresh OpenArm state before each request. Default: controlled by the `REFRESH` environment variable, or `true` when it is unset. |
 
