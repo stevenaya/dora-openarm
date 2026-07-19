@@ -55,7 +55,7 @@ nodes:
 | Input | Description |
 | --- | --- |
 | `request_position` | Requests the current arm position. The event ID is used and the event value is ignored. |
-| `request_state` | Requests the current arm state. The event ID is used and the event value is ignored. |
+| `request_state` | Requests one current arm-state snapshot and publishes both `state` and its `qpos` as `position`. The event ID is used and the event value is ignored. |
 | `move_position` | Sends a new target position to the arm. The value may be a struct containing `qpos` (`[{"qpos": [...]}]`), a position array directly, or a legacy struct containing `new_position`. When initial alignment is enabled, this input drives the alignment until it completes. |
 
 ### Outputs

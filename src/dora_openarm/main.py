@@ -240,6 +240,10 @@ def main():
                 continue
             state = arm.fetch_state(refresh=args.refresh_every_request)
             node.send_output("state", build_state_output(state))
+            node.send_output(
+                "position",
+                build_qpos_output(np.asarray(state["qpos"], dtype=np.float32)),
+            )
         elif event_id == "move_position":
             if status is ArmStatus.STOPPED:
                 continue
