@@ -17,6 +17,7 @@
 import argparse
 import dataclasses
 import enum
+import numbers
 import dora
 import openarm_driver
 import os
@@ -41,7 +42,7 @@ class AlignState:
     step_limit: float = 0.001
 
 
-def _align(arm, state, new_position, name, threshold, trigger=None):
+def _align(arm, state, new_position, name, threshold, send_position, trigger=None):
     """Safety: Align OpenArm with the position."""
     if trigger == "gripper":  # Check if gripper is active (threshold ~ -10 deg)
         gripper_position = new_position[-1]  # Last value is gripper's position
@@ -67,7 +68,7 @@ def _align(arm, state, new_position, name, threshold, trigger=None):
     step_move = np.clip(diff, -state.step_limit, state.step_limit)
     state.align_target += step_move
 
-    arm.send_position(state.align_target)
+    send_position(state.align_target)
 
     # Check the physical position on the next command after the arm has moved.
     return False
@@ -119,6 +120,26 @@ def extract_values(value: pa.Array, key: str) -> np.ndarray:
     if pa.types.is_struct(value.type):
         value = value.field(key)[0].values
     return np.array(value, dtype=np.float32)
+
+
+def command_epoch_matches(metadata: dict, start_epoch: int) -> bool:
+    """Accept legacy commands or commands addressed to the current start."""
+    if "start_epoch" not in metadata:
+        return True
+    value = metadata["start_epoch"]
+    return (
+        isinstance(value, numbers.Integral)
+        and not isinstance(value, bool)
+        and int(value) == start_epoch
+    )
+
+
+def startup_command_metadata(arm) -> dict | None:
+    """Describe the final command dispatched by the driver's start trajectory."""
+    executed_timestamp = arm.last_command_executed_timestamp_ns
+    if executed_timestamp is None:
+        return None
+    return {"timestamp": executed_timestamp}
 
 
 def main():
@@ -186,19 +207,59 @@ def main():
     config = openarm_driver.Config(args.config)
     align_threshold = args.align_threshold
     arm = None
+    start_epoch = 0
+    latest_command_metadata = None
     ready_status = ArmStatus.ALIGNED if args.align else ArmStatus.STARTED
+
+    def output_metadata(metadata: dict | None = None) -> dict:
+        result = dict(metadata or {})
+        result["start_epoch"] = start_epoch
+        return result
+
     if args.start_on_startup:
         arm = openarm_driver.SingleArmDriver(name, config)
         arm.start()
+        start_epoch += 1
+        latest_command_metadata = startup_command_metadata(arm)
         align_state = (
             AlignState(step_limit=args.align_delta_limit) if args.align else None
         )
         status = ArmStatus.STARTED
-        node.send_output("status", pa.array([status]))
+        node.send_output("status", pa.array([status]), output_metadata())
     else:
         align_state = None
         status = ArmStatus.STOPPED
-        node.send_output("status", pa.array([ArmStatus.STOPPED]))
+        node.send_output("status", pa.array([ArmStatus.STOPPED]), output_metadata())
+
+    def send_latest_command() -> None:
+        """Publish the last command that the driver actually accepted."""
+        if arm is None or latest_command_metadata is None:
+            return
+        executed_timestamp = arm.last_command_executed_timestamp_ns
+        if executed_timestamp is None:
+            return
+        metadata = output_metadata(latest_command_metadata)
+        metadata["executed_timestamp"] = executed_timestamp
+        node.send_output(
+            "latest_command",
+            build_qpos_output(np.asarray(arm.last_command, dtype=np.float32)),
+            metadata,
+        )
+
+    def send_position(position: np.ndarray, metadata: dict) -> bool:
+        """Send one checked command and publish the final driver target."""
+        nonlocal latest_command_metadata
+        if not arm.send_position(position):
+            return False
+        executed_timestamp = arm.last_command_executed_timestamp_ns
+        if executed_timestamp is None:
+            raise RuntimeError(
+                "driver accepted a command without an executed timestamp"
+            )
+        latest_command_metadata = dict(metadata)
+        send_latest_command()
+        return True
+
     for event in node:
         if event["type"] != "INPUT":
             continue
@@ -209,23 +270,35 @@ def main():
             if command == "start":
                 if arm is not None:
                     arm.stop()  # Stop the existing session before replacing it
+                latest_command_metadata = None
                 arm = openarm_driver.SingleArmDriver(
                     name, config
                 )  # Re-initialize the arm to ensure a fresh start
                 arm.start()
+                start_epoch += 1
+                latest_command_metadata = startup_command_metadata(arm)
                 align_state = (
                     AlignState(step_limit=args.align_delta_limit)
                     if args.align
                     else None
                 )
                 status = ArmStatus.STARTED
-                node.send_output("status", pa.array([status]))
+                node.send_output(
+                    "status",
+                    pa.array([status]),
+                    output_metadata(event["metadata"]),
+                )
             elif command == "stop":
                 status = ArmStatus.STOPPED
-                node.send_output("status", pa.array([ArmStatus.STOPPED]))
+                node.send_output(
+                    "status",
+                    pa.array([ArmStatus.STOPPED]),
+                    output_metadata(event["metadata"]),
+                )
                 if arm is not None:
                     arm.stop()
                     arm = None  # Drop the instance to free resources
+                latest_command_metadata = None
                 align_state = None
         elif event_id == "request_position":
             if status is ArmStatus.STOPPED:
@@ -236,14 +309,30 @@ def main():
             node.send_output(
                 "position",
                 build_qpos_output(np.asarray(current_position, dtype=np.float32)),
+                output_metadata(event["metadata"]),
             )
         elif event_id == "request_state":
             if status is ArmStatus.STOPPED:
                 continue
             state = arm.fetch_state(refresh=args.refresh_every_request)
-            node.send_output("state", build_state_output(state))
+            metadata = output_metadata(event["metadata"])
+            node.send_output("state", build_state_output(state), metadata)
+            node.send_output(
+                "position",
+                build_qpos_output(np.asarray(state["qpos"], dtype=np.float32)),
+                metadata,
+            )
+            send_latest_command()
         elif event_id == "move_position":
             if status is ArmStatus.STOPPED:
+                continue
+            if not command_epoch_matches(event["metadata"], start_epoch):
+                print(
+                    "Ignoring move_position with malformed or stale "
+                    f"start_epoch: {event['metadata'].get('start_epoch')!r} "
+                    f"(current={start_epoch})",
+                    flush=True,
+                )
                 continue
             value = event["value"]
             if isinstance(value, pa.StructArray):
@@ -261,7 +350,7 @@ def main():
                 # other_arm_position = None
 
             if status is ready_status:
-                arm.send_position(new_position)
+                send_position(new_position, event["metadata"])
             elif status is ArmStatus.STARTED:
                 is_aligned = _align(
                     arm,
@@ -269,12 +358,17 @@ def main():
                     new_position,
                     name,
                     align_threshold,
+                    lambda position: send_position(position, event["metadata"]),
                     trigger=args.align_trigger,
                 )
                 if is_aligned:
                     arm.send_position(new_position)
                     status = ArmStatus.ALIGNED
-                    node.send_output("status", pa.array([ArmStatus.ALIGNED]))
+                    node.send_output(
+                        "status",
+                        pa.array([ArmStatus.ALIGNED]),
+                        output_metadata(event["metadata"]),
+                    )
     if arm is not None:
         if args.stop:
             arm.stop()
