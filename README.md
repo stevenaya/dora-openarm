@@ -73,6 +73,10 @@ Every output carries a process-local `start_epoch`. It increments after each
 successful `start` and distinguishes commands and observations from earlier
 arm-enable sessions.
 
+See [Command lifecycle and safety](docs/command-lifecycle-and-safety.md) for the
+command flow, timestamp semantics, session guards, alignment behavior, and
+driver safety layers.
+
 ## License
 
 Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
