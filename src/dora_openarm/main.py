@@ -191,7 +191,7 @@ def main():
         "--refresh-every-request",
         action=argparse.BooleanOptionalAction,
         default=_env_flag("REFRESH", True),
-        help="Refresh OpenArm on every request to make it more accurate.",
+        help="Refresh OpenArm on every publish_tick or position request.",
     )
     parser.add_argument(
         "--start-on-startup",
@@ -247,7 +247,7 @@ def main():
         )
 
     def send_position(position: np.ndarray, metadata: dict) -> bool:
-        """Send one checked command and publish the final driver target."""
+        """Send one checked command and cache metadata for the next publish_tick."""
         nonlocal latest_command_metadata
         if not arm.send_position(position):
             return False
@@ -257,7 +257,6 @@ def main():
                 "driver accepted a command without an executed timestamp"
             )
         latest_command_metadata = dict(metadata)
-        send_latest_command()
         return True
 
     for event in node:
@@ -311,7 +310,7 @@ def main():
                 build_qpos_output(np.asarray(current_position, dtype=np.float32)),
                 output_metadata(event["metadata"]),
             )
-        elif event_id == "request_state":
+        elif event_id == "publish_tick":
             if status is ArmStatus.STOPPED:
                 continue
             state = arm.fetch_state(refresh=args.refresh_every_request)

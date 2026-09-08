@@ -30,20 +30,34 @@ move_position
   -> input parsing
   -> initial alignment, when enabled and not complete
   -> driver safety checks
-       -> hard rejection: dispatch nothing and publish no latest_command
+       -> hard rejection: dispatch nothing and leave the cache unchanged
        -> soft correction: dispatch the corrected target
        -> accepted as-is: dispatch the requested target
-  -> latest_command with source and execution metadata
+  -> cache source metadata for the accepted command
+
+publish_tick
+  -> stopped-state check
+  -> fetch_state() once
+  -> publish state and position from that snapshot
+  -> publish latest_command with cached source and execution metadata, if valid
 ```
 
 The driver updates `last_command` only after a command passes all hard safety
-checks. The node publishes this driver value rather than echoing the original
-input. As a result, `latest_command.qpos` includes any joint-position or
-joint-velocity correction applied by the driver.
+checks. On each `publish_tick`, the node publishes this driver value rather
+than echoing the original input. As a result, `latest_command.qpos` includes any
+joint-position or joint-velocity correction applied by the driver.
 
 If the driver rejects a command, `send_position()` returns false. The node does
-not update the cached command metadata and does not publish `latest_command`
-for that input.
+not update the cached command metadata. Subsequent ticks continue to publish
+the previous accepted command, if one exists, with its original timestamps.
+
+`publish_tick` is the only trigger for `latest_command`. A `move_position` event
+applies the command and updates the cache without publishing a snapshot. If
+several commands are accepted between ticks, only the latest is reported.
+Consumers therefore receive a sampled command state, not a complete log of
+every dispatch. The reporting rate is set by the tick source; a 4 ms timer
+requests up to 250 snapshots per second per arm. Ticks do not resend cached
+position targets to the motor interface.
 
 ## Session epochs
 
@@ -89,6 +103,9 @@ domain, or when the source and driver hosts have synchronized wall clocks.
 
 `executed_timestamp` is a software dispatch timestamp. It does not represent a
 motor acknowledgement, physical motion onset, or target-settling time.
+The delay until the next tick is not included in this timestamp difference.
+Command snapshots keep the command's metadata, not the triggering tick's
+metadata; the tick metadata is used for `state` and `position` instead.
 
 ### Startup commands
 
@@ -96,20 +113,20 @@ The driver's startup trajectory has no external source event. If it dispatches
 one or more commands, the final dispatch time is used as both `timestamp` and
 `executed_timestamp` for the cached startup command.
 
-The startup command becomes visible when a later `request_state` asks the node
-to republish the driver's last valid command. If the configured startup
+The startup command becomes visible when a later `publish_tick` asks the node
+to publish the driver's last valid command. If the configured startup
 trajectory dispatches no command, there is no startup `latest_command`.
 
-Republishing a command preserves its original timestamps. A request does not
+Republishing a command preserves its original timestamps. A tick does not
 assign a new execution time.
 
 ## State snapshot consistency
 
-A `request_state` performs one `fetch_state()` operation and derives both state
+A `publish_tick` performs one `fetch_state()` operation and derives both state
 outputs from the same returned object:
 
 ```text
-one driver/CAN state read
+publish_tick -> one driver state read (CAN refresh when enabled)
   -> state     (qpos, qvel, qtorque, tmos, trotor)
   -> position  (the same qpos sample)
   -> latest_command snapshot, when one exists
@@ -119,8 +136,20 @@ This avoids a second CAN refresh and guarantees that `state.qpos` and
 `position.qpos` belong to the same hardware sample. `latest_command` remains a
 command snapshot and is intentionally independent of the measured state.
 
-`request_position` remains available when only a fresh position read is
-required.
+`request_position` remains available when only a position read is required; it
+does not publish `latest_command`. `--refresh-every-request` controls CAN
+refresh for both `publish_tick` events and position requests.
+
+Dataflows using the former `request_state` input must rename it to
+`publish_tick` and connect it to a timer or a tick-forwarding node:
+
+```yaml
+inputs:
+  publish_tick: quittable-tick-arm/tick
+```
+
+There is no `request_state` or `tick` alias. Commands, startup, and alignment
+status changes do not trigger snapshots.
 
 ## Initial alignment
 
@@ -151,10 +180,10 @@ radians per second. The resulting alignment speed therefore depends on the
 incoming command frequency.
 
 When the measured arm enters the alignment threshold, `_align()` submits the
-final requested target through the same checked and reporting path used during
+final requested target through the same checked and caching path used during
 normal control. The node publishes `aligned` only if the driver accepts that
-final command. If it is rejected, the node remains in `started` and publishes
-neither `aligned` nor a new `latest_command`.
+final command; its command snapshot is published on the next tick. If it is
+rejected, the node remains in `started` and leaves the command cache unchanged.
 
 ## Driver safety pipeline
 
@@ -180,14 +209,17 @@ when commands resume.
 
 A non-fatal position or velocity clamp produces a corrected target. The driver
 dispatches that corrected target, stores it as `last_command`, and the node
-publishes it as `latest_command`.
+publishes it as `latest_command` on the next tick unless a newer command has
+already been accepted.
 
 ### Hard rejection
 
-A hard rejection dispatches no target, leaves `last_command` unchanged, and
-produces no `latest_command`. A joint-delta violation also latches the driver's
-safety-stop state. Later position commands are ignored until a stop/start cycle
-creates a fresh driver session and clears the latch.
+A hard rejection dispatches no target and leaves `last_command` and its cached
+metadata unchanged. Ticks may still publish the previous valid command; that
+snapshot does not indicate a new dispatch or that the driver is accepting
+commands. A joint-delta violation also latches the driver's safety-stop state.
+Later position commands are ignored until a stop/start cycle creates a fresh
+driver session and clears the latch.
 
 ## Stop behavior
 
@@ -199,5 +231,5 @@ On `stop`, the node:
 4. Clears cached alignment state and command metadata.
 
 Commands generated internally by the driver's stop behavior are not published
-as `latest_command`. The next successful `start` creates a fresh driver
-instance and advances `start_epoch`.
+as `latest_command`. While stopped, ticks produce no arm snapshots. The next
+successful `start` creates a fresh driver instance and advances `start_epoch`.
