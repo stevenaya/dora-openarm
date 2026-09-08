@@ -136,7 +136,7 @@ def command_epoch_matches(metadata: dict, start_epoch: int) -> bool:
 
 def startup_command_metadata(arm) -> dict | None:
     """Describe the final command dispatched by the driver's start trajectory."""
-    executed_timestamp = arm.last_command_executed_timestamp_ns
+    executed_timestamp = arm.last_command_dispatch_timestamp_ns
     if executed_timestamp is None:
         return None
     return {"timestamp": executed_timestamp}
@@ -235,7 +235,7 @@ def main():
         """Publish the last command that the driver actually accepted."""
         if arm is None or latest_command_metadata is None:
             return
-        executed_timestamp = arm.last_command_executed_timestamp_ns
+        executed_timestamp = arm.last_command_dispatch_timestamp_ns
         if executed_timestamp is None:
             return
         metadata = output_metadata(latest_command_metadata)
@@ -251,7 +251,7 @@ def main():
         nonlocal latest_command_metadata
         if not arm.send_position(position):
             return False
-        executed_timestamp = arm.last_command_executed_timestamp_ns
+        executed_timestamp = arm.last_command_dispatch_timestamp_ns
         if executed_timestamp is None:
             raise RuntimeError(
                 "driver accepted a command without an executed timestamp"
