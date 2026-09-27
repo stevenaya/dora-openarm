@@ -1,0 +1,236 @@
+# Command lifecycle and safety
+
+This document describes how `dora-openarm` handles joint commands, reports the
+command accepted by the driver, associates metadata with arm sessions, and
+applies startup and driver-level safety checks.
+
+Exact joint limits and velocity limits are defined by the selected OpenArm
+driver configuration.
+
+## Position terminology
+
+The control path contains three different joint-position values:
+
+- A **requested command** is the `qpos` received on `move_position`.
+- An **accepted command** is the final target produced by the driver's safety
+  pipeline and dispatched to the motor interface. It can differ from the
+  requested command when a non-fatal safety check clamps it.
+- A **measured position** is read back from the arm and published as the `qpos` field of `state`.
+
+`latest_command` reports the accepted command. It is not a measurement and
+does not indicate that the physical arm has reached the target.
+
+## End-to-end command flow
+
+```text
+move_position
+  -> started/aligned-state check
+  -> start_epoch check
+  -> input parsing
+  -> initial alignment, when enabled and not complete
+  -> driver safety checks
+       -> hard rejection: dispatch nothing and leave the cache unchanged
+       -> soft correction: dispatch the corrected target
+       -> accepted as-is: dispatch the requested target
+  -> cache source metadata for the accepted command
+
+publish_tick
+  -> started/aligned-state check
+  -> fetch_state() once
+  -> publish state with observation_timestamp and motor/CAN health
+  -> publish latest_command with cached source and execution metadata, if valid
+```
+
+The driver updates `last_command` only after a command passes all hard safety
+checks. On each `publish_tick`, the node publishes this driver value rather
+than echoing the original input. As a result, `latest_command.qpos` includes any
+joint-position or joint-velocity correction applied by the driver.
+
+If the driver rejects a command, `send_position()` returns false. The node does
+not update the cached command metadata. It emits `error` with the reason and
+blocks further moves and snapshots until an explicit stop/start.
+
+`publish_tick` is the only trigger for `latest_command`. A `move_position` event
+applies the command and updates the cache without publishing a snapshot. If
+several commands are accepted between ticks, only the latest is reported.
+Consumers therefore receive a sampled command state, not a complete log of
+every dispatch. The reporting rate is set by the tick source; a 4 ms timer
+requests up to 250 snapshots per second per arm. Ticks do not resend cached
+position targets to the motor interface.
+
+## Session epochs
+
+`start_epoch` is a process-local arm-enable generation number. It starts at
+zero and increments only after a successful explicit `arm.start()`. Node
+startup does not construct a driver or enable motors. A failed start emits
+`error` with `metadata.message` and the start request identity, without advancing
+the epoch. The instance is retained so an explicit stop can still disable motors.
+
+The node adds the current epoch to every output. A `move_position` carrying a
+`start_epoch` is accepted only when the value is a non-boolean integer equal to
+the current epoch. A malformed or mismatched epoch is logged and ignored. This
+prevents a queued command from an earlier arm-enable session from moving the
+arm after a stop/start cycle.
+
+For compatibility, commands without `start_epoch` are accepted. An upstream
+node must therefore copy the epoch from a current arm output into its commands
+to enable stale-session protection.
+
+The epoch has two intentional limitations:
+
+- It resets to zero when the `dora-openarm` process restarts.
+- It does not detect reordered commands within the same epoch.
+
+It is a session-generation guard, not a globally unique command identifier.
+
+## Command timestamps
+
+For a command originating from `move_position`, `latest_command` preserves the
+input metadata, including its `timestamp` when present, and adds:
+
+- `executed_timestamp`: wall-clock nanoseconds recorded immediately before the
+  driver dispatches the accepted target to the motor interface.
+- `start_epoch`: the current arm-enable generation. This overrides any copied
+  input value with the driver-side source of truth.
+
+These timestamps can be used to measure source-to-driver latency:
+
+```text
+source-to-driver latency = executed_timestamp - timestamp
+```
+
+This subtraction is meaningful only when both timestamps use the same clock
+domain, or when the source and driver hosts have synchronized wall clocks.
+
+`executed_timestamp` is a software dispatch timestamp. It does not represent a
+motor acknowledgement, physical motion onset, or target-settling time.
+The delay until the next tick is not included in this timestamp difference.
+Command snapshots keep the command's metadata, not the triggering tick's
+metadata. State preserves other tick metadata, removes its `timestamp`, and
+adds `observation_timestamp` captured after the snapshot read. Dora supplies the
+state message timestamp; recorder uses the observation timestamp for arm state.
+
+### Startup commands
+
+The driver's startup trajectory has no external source event. If it dispatches
+one or more commands, the final dispatch time is used as both `timestamp` and
+`executed_timestamp` for the cached startup command.
+
+The startup command becomes visible when a later `publish_tick` asks the node
+to publish the driver's last valid command. If the configured startup
+trajectory dispatches no command, there is no startup `latest_command`.
+
+Republishing a command preserves its original timestamps. A tick does not
+assign a new execution time.
+
+## State snapshot consistency
+
+A `publish_tick` performs one `fetch_state()` operation:
+
+```text
+publish_tick -> one driver state read (CAN refresh when enabled)
+  -> state (qpos, qvel, qtorque, tmos, trotor, motor_status, bus)
+  -> latest_command snapshot, when one exists
+```
+
+Consumers needing only joint positions extract `state.qpos`. `latest_command`
+is intentionally independent of measured state and retains its dispatch time.
+`--refresh-every-request` controls CAN refresh for `publish_tick`.
+
+Dataflows using the former `request_state` input must rename it to
+`publish_tick` and connect it to a timer or a tick-forwarding node:
+
+```yaml
+inputs:
+  publish_tick: quittable-tick-arm/tick
+```
+
+There are no `request_state`, `request_position`, `request_command` or `tick` aliases. Commands, startup, and alignment
+status changes do not trigger snapshots.
+
+## Initial alignment
+
+Initial alignment is a node-level startup guard. It is created after each start
+when `--align` is enabled and is not re-entered during normal control.
+
+The first alignment target is initialized from the measured arm position. On
+each eligible `move_position` input, every joint moves toward the incoming
+target by at most `--align-delta-limit` radians:
+
+```text
+delta = clip(requested - alignment_target, -delta_limit, delta_limit)
+alignment_target = alignment_target + delta
+```
+
+The step limit also applies to the gripper. Alignment completion compares only
+the seven arm joints with `--align-threshold`; the gripper is excluded from the
+completion test.
+
+With `--align-trigger gripper`, alignment remains paused until the target
+gripper angle satisfies the side-specific condition:
+
+- Right arm: target gripper angle is greater than `-5 deg`.
+- Left arm: target gripper angle is less than `5 deg`.
+
+`--align-delta-limit` is a delta per input event, not a physical velocity in
+radians per second. The resulting alignment speed therefore depends on the
+incoming command frequency.
+
+When the measured arm enters the alignment threshold, `_align()` submits the
+final requested target through the same checked and caching path used during
+normal control. The node publishes `aligned` only if the driver accepts that
+final command; its command snapshot is published on the next tick. If it is
+rejected, the node reports `error` and leaves the command cache unchanged.
+
+## Driver safety pipeline
+
+Alignment commands and normal-control commands pass through the same driver
+safety pipeline. The default checks run in this order:
+
+1. **Joint-position limits** clamp each target to its configured valid range.
+2. **Joint-delta limits** compare the corrected target with `last_command`. An
+   excessive single-command jump latches a safety stop and rejects the command.
+3. **Optional joint-velocity limits** clamp each joint to the distance allowed
+   since the previous accepted command.
+
+For velocity limiting, the driver uses:
+
+```text
+allowed_delta = configured_velocity_limit * min(elapsed_time, 0.04 s)
+```
+
+The 40 ms cap prevents a long input pause from authorizing one large movement
+when commands resume.
+
+### Soft correction
+
+A non-fatal position or velocity clamp produces a corrected target. The driver
+dispatches that corrected target, stores it as `last_command`, and the node
+publishes it as `latest_command` on the next tick unless a newer command has
+already been accepted.
+
+### Hard rejection
+
+A hard rejection dispatches no target and leaves `last_command` and its cached
+metadata unchanged. The node emits `error` and stops publishing snapshots and
+accepting moves. A joint-delta violation also latches the driver's safety-stop state.
+Later position commands are ignored until a stop/start cycle creates a fresh
+driver session and clears the latch.
+
+## Stop behavior
+
+On `stop`, the node:
+
+1. Runs the driver's configured stop behavior. A latched safety fault skips the
+   return trajectory before disabling motors.
+2. On success, releases the driver instance and clears alignment/command metadata.
+3. Publishes `stopped` with the current epoch only after stop completes.
+
+If stop raises, the node retains the instance and reports `error`; it does not
+claim the motors are disabled. Start/command/state-read failures also report an
+error without automatic retry. On exit after a fault, stop is attempted even
+with `--no-stop`. Ordinary stop is not an instantaneous hardware emergency stop.
+
+Commands generated internally by the driver's stop behavior are not published
+as `latest_command`. While stopped, ticks produce no arm snapshots. The next
+successful `start` creates a fresh driver instance and advances `start_epoch`.
