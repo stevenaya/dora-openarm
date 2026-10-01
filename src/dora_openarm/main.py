@@ -22,6 +22,7 @@ import openarm_driver
 import os
 import pathlib
 import time
+import traceback
 import pyarrow as pa
 import numpy as np
 
@@ -30,6 +31,7 @@ class ArmStatus(str, enum.Enum):
     """Arm control states."""
 
     STOPPED = "stopped"
+    ERROR = "error"
     STARTED = "started"
     ALIGNED = "aligned"
 
@@ -42,7 +44,7 @@ class AlignState:
     step_limit: float = 0.001
 
 
-def _align(arm, state, new_position, name, threshold, trigger=None):
+def _align(arm, state, new_position, name, threshold, send_position, trigger=None):
     """Safety: Align OpenArm with the position."""
     if trigger == "gripper":  # Check if gripper is active (threshold ~ -10 deg)
         gripper_position = new_position[-1]  # Last value is gripper's position
@@ -61,14 +63,14 @@ def _align(arm, state, new_position, name, threshold, trigger=None):
     def is_aligned(position1, position2):
         return np.all(np.abs(position1[:-1] - position2[:-1]) < threshold)
 
-    # If OpenArm is already aligned, we do nothing.
+    # Accept the final target before reporting alignment complete.
     if is_aligned(new_position, current_position):
-        return True
+        return send_position(new_position)
     diff = new_position - state.align_target
     step_move = np.clip(diff, -state.step_limit, state.step_limit)
     state.align_target += step_move
 
-    arm.send_position(state.align_target)
+    send_position(state.align_target)
 
     # Check the physical position on the next command after the arm has moved.
     return False
@@ -183,7 +185,9 @@ def build_state_output(state, health: tuple[list[str], dict]) -> pa.Array:
 def extract_values(value: pa.Array, key: str) -> np.ndarray:
     """Read `key` from a length-1 StructArray, or a flat array as-is."""
     if pa.types.is_struct(value.type):
-        value = value.field(key)[0].values
+        value = value.field(key)
+        if pa.types.is_list(value.type):
+            value = value[0].values
     return np.array(value, dtype=np.float32)
 
 
@@ -237,7 +241,7 @@ def main():
     parser.add_argument(
         "--align-delta-limit",
         default=0.001,
-        help="Maximum joint delta per alignment command [rad] (default: 0.001).",
+        help="Maximum intermediate alignment target step [rad] (default: 0.001).",
         type=float,
     )
     parser.add_argument(
@@ -256,13 +260,7 @@ def main():
         "--refresh-every-request",
         action=argparse.BooleanOptionalAction,
         default=_env_flag("REFRESH", True),
-        help="Refresh OpenArm on every request to make it more accurate.",
-    )
-    parser.add_argument(
-        "--start-on-startup",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Start the arm on startup.",
+        help="Refresh OpenArm on every publish_tick.",
     )
     args = parser.parse_args()
     if args.align_delta_limit <= 0.0:
@@ -273,6 +271,10 @@ def main():
     align_threshold = args.align_threshold
     arm = None
     start_epoch = 0
+    latest_command_metadata = None
+    session_metadata = {}
+    align_state = None
+    status = ArmStatus.STOPPED
     ready_status = ArmStatus.ALIGNED if args.align else ArmStatus.STARTED
 
     def output_metadata(metadata: dict | None = None) -> dict:
@@ -280,132 +282,161 @@ def main():
         result["start_epoch"] = start_epoch
         return result
 
-    if args.start_on_startup:
-        arm = openarm_driver.SingleArmDriver(
-            name, config, can_interface=args.can_interface
-        )
-        arm.start()
-        start_epoch += 1
-        align_state = (
-            AlignState(step_limit=args.align_delta_limit) if args.align else None
-        )
-        status = ArmStatus.STARTED
-        node.send_output("status", pa.array([status]), output_metadata())
-    else:
+    node.send_output("status", pa.array([status]), output_metadata())
+
+    def report_error(message: str) -> None:
+        nonlocal status, align_state
+        status = ArmStatus.ERROR
         align_state = None
-        status = ArmStatus.STOPPED
-        node.send_output("status", pa.array([ArmStatus.STOPPED]), output_metadata())
-    for event in node:
-        if event["type"] != "INPUT":
-            continue
+        print(f"{name}: {message}", flush=True)
+        metadata = output_metadata(session_metadata)
+        metadata["message"] = message
+        node.send_output("status", pa.array([status]), metadata)
 
-        event_id = event["id"]
-        if event_id == "command":
-            command = event["value"][0].as_py()
-            if command == "start":
-                if arm is not None:
-                    arm.stop()  # Stop the existing session before replacing it
-                # Re-initialize the arm to ensure a fresh start
-                arm = openarm_driver.SingleArmDriver(
-                    name, config, can_interface=args.can_interface
-                )
-                arm.start()
-                start_epoch += 1
-                align_state = (
-                    AlignState(step_limit=args.align_delta_limit)
-                    if args.align
-                    else None
-                )
-                status = ArmStatus.STARTED
-                node.send_output(
-                    "status", pa.array([status]), output_metadata(event["metadata"])
-                )
-            elif command == "stop":
-                status = ArmStatus.STOPPED
-                node.send_output(
-                    "status",
-                    pa.array([ArmStatus.STOPPED]),
-                    output_metadata(event["metadata"]),
-                )
-                if arm is not None:
-                    arm.stop()
-                    arm = None  # Drop the instance to free resources
-                align_state = None
-        elif event_id == "request_position":
-            if status is ArmStatus.STOPPED:
-                continue
-            current_position = arm.fetch_position(
-                refresh=args.refresh_every_request,
-            )
-            snapshot_timestamp = time.time_ns()
-            metadata = output_metadata(event["metadata"])
-            metadata.pop("timestamp", None)
-            metadata["observation_timestamp"] = snapshot_timestamp
-            node.send_output(
-                "position",
-                build_qpos_output(np.asarray(current_position, dtype=np.float32)),
-                metadata,
-            )
-        elif event_id == "request_state":
-            if status is ArmStatus.STOPPED:
-                continue
-            state = arm.fetch_state(refresh=args.refresh_every_request)
-            health = arm.get_health()
-            snapshot_timestamp = time.time_ns()
-            metadata = output_metadata(event["metadata"])
-            metadata.pop("timestamp", None)
-            metadata["observation_timestamp"] = snapshot_timestamp
-            node.send_output("state", build_state_output(state, health), metadata)
-        elif event_id == "move_position":
-            if status is ArmStatus.STOPPED:
-                continue
-            if not command_epoch_matches(event["metadata"], start_epoch):
-                print(
-                    "Ignoring move_position with malformed or stale "
-                    f"start_epoch: {event['metadata'].get('start_epoch')!r} "
-                    f"(current={start_epoch})",
-                    flush=True,
-                )
-                continue
-            value = event["value"]
-            if isinstance(value, pa.StructArray):
-                names = value.type.names
-                if "qpos" in names:
-                    new_position = extract_values(value, "qpos")
-                else:
-                    new_position = np.array(
-                        value.field("new_position"), dtype=np.float32
-                    )
-                # TODO: We use this for safety check later.
-                # other_arm_position = value.field("other_arm_position")
-            else:
-                new_position = np.array(value, dtype=np.float32)
-                # other_arm_position = None
-
-            if status is ready_status:
-                arm.send_position(new_position)
-            elif status is ArmStatus.STARTED:
-                is_aligned = _align(
-                    arm,
-                    align_state,
-                    new_position,
-                    name,
-                    align_threshold,
-                    trigger=args.align_trigger,
-                )
-                if is_aligned:
-                    arm.send_position(new_position)
-                    status = ArmStatus.ALIGNED
-                    node.send_output(
-                        "status",
-                        pa.array([ArmStatus.ALIGNED]),
-                        output_metadata(event["metadata"]),
-                    )
-    if arm is not None:
-        if args.stop:
-            arm.stop()
+    def send_position(position: np.ndarray, metadata: dict) -> bool:
+        """Cache source metadata only after the driver accepts the target."""
+        nonlocal latest_command_metadata
+        accepted = arm.send_position(position)
+        if accepted:
+            latest_command_metadata = dict(metadata)
         else:
-            arm.move_to_start_position()
+            report_error(arm.safety_stop_reason or "Position command rejected")
+        return accepted
+
+    clean_exit = False
+    try:
+        for event in node:
+            if event["type"] == "STOP":
+                break
+            if event["type"] != "INPUT":
+                continue
+            event_id = event["id"]
+            try:
+                if event_id == "command":
+                    command = event["value"][0].as_py()
+                    if command == "start":
+                        session_metadata = dict(event["metadata"])
+                        if arm is not None:
+                            arm.stop(run_trajectory=status is not ArmStatus.ERROR)
+                            arm = None
+                        latest_command_metadata = None
+                        align_state = None
+                        arm = openarm_driver.SingleArmDriver(
+                            name, config, can_interface=args.can_interface
+                        )
+                        if not arm.start():
+                            report_error(
+                                arm.safety_stop_reason
+                                or "Startup trajectory interrupted"
+                            )
+                            continue
+                        start_epoch += 1
+                        executed_timestamp = arm.last_command_dispatch_timestamp_ns
+                        latest_command_metadata = (
+                            {"timestamp": executed_timestamp}
+                            if executed_timestamp is not None
+                            else None
+                        )
+                        align_state = (
+                            AlignState(step_limit=args.align_delta_limit)
+                            if args.align
+                            else None
+                        )
+                        status = ArmStatus.STARTED
+                        node.send_output(
+                            "status",
+                            pa.array([status]),
+                            output_metadata(session_metadata),
+                        )
+                    elif command == "stop":
+                        if arm is not None:
+                            arm.stop(run_trajectory=status is not ArmStatus.ERROR)
+                        arm = None
+                        latest_command_metadata = None
+                        align_state = None
+                        status = ArmStatus.STOPPED
+                        node.send_output(
+                            "status",
+                            pa.array([status]),
+                            output_metadata({**session_metadata, **event["metadata"]}),
+                        )
+                elif status not in (ArmStatus.STARTED, ArmStatus.ALIGNED):
+                    continue
+                elif event_id == "publish_tick":
+                    state = arm.fetch_state(refresh=args.refresh_every_request)
+                    health = arm.get_health()
+                    metadata = output_metadata(event["metadata"])
+                    metadata.pop("timestamp", None)
+                    metadata["observation_timestamp"] = time.time_ns()
+                    node.send_output(
+                        "state", build_state_output(state, health), metadata
+                    )
+                    if latest_command_metadata is not None:
+                        metadata = output_metadata(latest_command_metadata)
+                        metadata["executed_timestamp"] = (
+                            arm.last_command_dispatch_timestamp_ns
+                        )
+                        node.send_output(
+                            "latest_command",
+                            build_qpos_output(arm.last_command),
+                            metadata,
+                        )
+                elif event_id == "move_position":
+                    if not command_epoch_matches(event["metadata"], start_epoch):
+                        print(
+                            "Ignoring move_position with malformed or stale "
+                            f"start_epoch: {event['metadata'].get('start_epoch')!r} "
+                            f"(current={start_epoch})",
+                            flush=True,
+                        )
+                        continue
+                    value = event["value"]
+                    key = (
+                        "qpos"
+                        if pa.types.is_struct(value.type) and "qpos" in value.type.names
+                        else "new_position"
+                    )
+                    new_position = extract_values(value, key)
+                    if status is ready_status:
+                        send_position(new_position, event["metadata"])
+                    elif _align(
+                        arm,
+                        align_state,
+                        new_position,
+                        name,
+                        align_threshold,
+                        lambda position: send_position(position, event["metadata"]),
+                        trigger=args.align_trigger,
+                    ):
+                        status = ArmStatus.ALIGNED
+                        node.send_output(
+                            "status",
+                            pa.array([status]),
+                            output_metadata(event["metadata"]),
+                        )
+            except Exception as error:
+                traceback.print_exc()
+                report_error(f"{event_id} failed: {error}")
+
+        if arm is not None and status is not ArmStatus.ERROR and not args.stop:
+            if not arm.move_to_start_position():
+                report_error(
+                    arm.safety_stop_reason or "Shutdown trajectory interrupted"
+                )
+        clean_exit = True
+    except Exception as error:
+        report_error(f"Node exiting after failure: {error}")
+        raise
+    finally:
+        if arm is not None and (
+            args.stop or status is ArmStatus.ERROR or not clean_exit
+        ):
+            try:
+                arm.stop(run_trajectory=clean_exit and status is not ArmStatus.ERROR)
+            except Exception as error:
+                traceback.print_exc()
+                report_error(f"Shutdown failed: {error}")
+                raise
 
 
 if __name__ == "__main__":
